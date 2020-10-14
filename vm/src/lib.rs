@@ -1,6 +1,6 @@
 pub mod datamodel;
 pub mod machine;
-pub mod op;
+pub mod operation;
 
 use std::rc::Rc;
 
