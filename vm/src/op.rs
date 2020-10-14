@@ -6,17 +6,6 @@ use crate::{
     datamodel::{BytesBuffer, List, StringBuffer, Value},
     machine::{CallFrame},
 };
-/*
-10-13
-still deciding how to structure the code for
-parsing and running op-codes, while also sharing as much info with the code
-for declaring op-codes and serializing to a buffer
-
-10-14
-I decided to use named consts to assign number code to each operation. for serializing to
-a buffer, we'll manually write a match statement to write the correct number code based on
-the named constants.
-*/
 
 macro_rules! type_err {
     ($t:expr, $pos:expr) => {
@@ -34,9 +23,6 @@ macro_rules! bytecode_take {
             t
         }
     };
-}
-
-macro_rules! bytecode_next {
     ($frame:expr, $cursor:expr) => {
         {
             let t = $frame.get_bytecode()
@@ -192,7 +178,7 @@ pub fn parse_and_run(frame: &mut CallFrame) -> Result<VmAction, VmError> {
             Ok(VmAction::None)
         },
         CALL => {
-            let num_args = *bytecode_next!(frame, cursor) as usize;
+            let num_args = *bytecode_take!(frame, cursor) as usize;
             let fn_target = frame.pop()?;
             let mut args = Vec::new();
             for _ in 0..num_args {
@@ -206,15 +192,14 @@ pub fn parse_and_run(frame: &mut CallFrame) -> Result<VmAction, VmError> {
         },
         RETURN => Ok(VmAction::Return(frame.pop()?)),
         JUMP => {
-            let dst = bytecode_take!(frame, cursor, 2);
-            let dst = i16::from_be_bytes([dst[0], dst[1]]);
+            let dst = bytecode_take!(frame, cursor, 4);
+            let dst = i32::from_be_bytes(dst.try_into().unwrap());
             Ok(VmAction::Jump(dst))
         },
         JUMP_ZERO => {
-            let dst = bytecode_take!(frame, cursor, 2);
-            let dst = i16::from_be_bytes([dst[0], dst[1]]);
+            let dst = bytecode_take!(frame, cursor, 4);
+            let dst = i32::from_be_bytes(dst.try_into().unwrap());
             let check = match frame.pop()? {
-                Value::None => true,
                 Value::Bool(t) => !t,
                 Value::Integer(t) => t == 0,
                 Value::Real(t) => t == 0.0,
@@ -227,9 +212,10 @@ pub fn parse_and_run(frame: &mut CallFrame) -> Result<VmAction, VmError> {
             }
         },
         JUMP_NEG => {
-            let dst = bytecode_take!(frame, cursor, 2);
-            let dst = i16::from_be_bytes([dst[0], dst[1]]);
+            let dst = bytecode_take!(frame, cursor, 4);
+            let dst = i32::from_be_bytes(dst.try_into().unwrap());
             let check = match frame.pop()? {
+                Value::None => true,
                 Value::Integer(t) => t < 0,
                 Value::Real(t) => t < 0.0,
                 e @ _ => type_err!(e, 0),
@@ -265,18 +251,18 @@ pub fn parse_and_run(frame: &mut CallFrame) -> Result<VmAction, VmError> {
             Ok(VmAction::None)
         },
         FRM_LOAD => {
-            let i = *bytecode_next!(frame, cursor);
+            let i = *bytecode_take!(frame, cursor);
             frame.push(frame.load(i)?.clone());
             Ok(VmAction::None)
         },
         FRM_STORE => {
-            let i = *bytecode_next!(frame, cursor);
+            let i = *bytecode_take!(frame, cursor);
             let t = frame.pop()?;
             frame.store(i, t);
             Ok(VmAction::None)
         },
         FRM_SWAP => {
-            let i = *bytecode_next!(frame, cursor);
+            let i = *bytecode_take!(frame, cursor);
             let mut t = frame.pop()?;
             frame.swap(i, &mut t);
             frame.push(t);
@@ -543,9 +529,9 @@ pub enum Operation {
     // call and jump
     Call(u8),
     Return,
-    Jump(i16),
-    JumpZero(i16),
-    JumpNeg(i16),
+    Jump(usize),
+    JumpZero(usize),
+    JumpNeg(usize),
     // literal
     LiteralNone,
     LiteralTrue,
@@ -578,4 +564,213 @@ pub enum Operation {
     SeqAppend,
     SeqLen,
     SeqResize,
+}
+
+pub fn assemble(ops: &[Operation]) -> Option<Vec<u8>> {
+    let mut out = vec![];
+    let mut offsets = vec![];
+    let mut jumps = vec![];
+    for op in ops.iter() {
+        offsets.push(out.len());
+        match op {
+            Operation::None => out.push(NONE),
+            Operation::Add => out.push(ADD),
+            Operation::Sub => out.push(SUB),
+            Operation::Mul => out.push(MUL),
+            Operation::Div => out.push(DIV),
+            Operation::Rem => out.push(REM),
+            Operation::Neg => out.push(NEG),
+            Operation::Shl => out.push(SHL),
+            Operation::Shr => out.push(SHR),
+            Operation::And => out.push(AND),
+            Operation::Or  => out.push(OR),
+            Operation::Xor => out.push(XOR),
+            Operation::Not => out.push(NOT),
+            Operation::IntToReal => out.push(INT_TO_REAL),
+            Operation::RealToInt => out.push(REAL_TO_INT),
+            Operation::Cmp => out.push(CMP),
+            Operation::Call(n) => {
+                out.push(CALL);
+                out.push(*n);
+            },
+            Operation::Return => out.push(RETURN),
+            Operation::Jump(n) => {
+                out.push(JUMP);
+                jumps.push((out.len(), *n));
+                out.extend_from_slice(&[0; 4]);
+            },
+            Operation::JumpZero(n) => {
+                out.push(JUMP_ZERO);
+                jumps.push((out.len(), *n));
+                out.extend_from_slice(&[0; 4]);
+            },
+            Operation::JumpNeg(n) => {
+                out.push(JUMP_NEG);
+                jumps.push((out.len(), *n));
+                out.extend_from_slice(&[0; 4]);
+            },
+            Operation::LiteralNone => out.push(LIT_NONE),
+            Operation::LiteralTrue => out.push(LIT_TRUE),
+            Operation::LiteralFalse => out.push(LIT_FALSE),
+            Operation::LiteralInteger(n) => {
+                out.push(LIT_INT);
+                out.extend_from_slice(&n.to_be_bytes());
+            },
+            Operation::LiteralReal(n) => {
+                out.push(LIT_REAL);
+                out.extend_from_slice(&n.to_be_bytes());
+            },
+            Operation::FrameLocalLoad(n) => {
+                out.push(FRM_LOAD);
+                out.push(*n);
+            },
+            Operation::FrameLocalStore(n) => {
+                out.push(FRM_STORE);
+                out.push(*n);
+            },
+            Operation::FrameLocalSwap(n) => {
+                out.push(FRM_SWAP);
+                out.push(*n);
+            },
+            Operation::FrameStackCopy => out.push(FRM_COPY),
+            Operation::FrameStackPop => out.push(FRM_POP),
+            Operation::ListCreate => out.push(LIST_CREATE),
+            Operation::ListPush => out.push(LIST_PUSH),
+            Operation::ListPop => out.push(LIST_POP),
+            Operation::ListDowngrade => out.push(LIST_DOWNGRADE),
+            Operation::ListUpgrade => out.push(LIST_UPGRADE),
+            Operation::BytesBufferCreate => out.push(BYTES_CREATE),
+            Operation::StringBufferCreate => out.push(STR_CREATE),
+            Operation::StringGetCharAt => out.push(STR_CHAR_AT),
+            Operation::StringGetChars => out.push(STR_CHARS),
+            Operation::SeqGet => out.push(SEQ_GET),
+            Operation::SeqSet => out.push(SEQ_SET),
+            Operation::SeqGetSlice => out.push(SEQ_GET_SLICE),
+            Operation::SeqSetSlice => out.push(SEQ_SET_SLICE),
+            Operation::SeqAppend => out.push(SEQ_APPEND),
+            Operation::SeqLen => out.push(SEQ_LEN),
+            Operation::SeqResize => out.push(SEQ_RESIZE),
+        }
+    }
+    for (j, dst) in jumps {
+        let i = *offsets.get(dst)? as isize;
+        let n: i32 = ((j as isize) - i - 1).try_into().ok()?;
+        out.get_mut(j..j+4)?.copy_from_slice(&n.to_be_bytes());
+    }
+    Some(out)
+}
+
+pub fn disassemble(bytecode: &[u8]) -> Option<Vec<Operation>> {
+    let mut offsets = vec![];
+    let mut jumps = vec![];
+    let mut ops = vec![];
+    let mut cursor = 0;
+    while let Some(op_code) = bytecode.get(cursor) {
+        offsets.push(cursor);
+        cursor += 1;
+        match *op_code {
+            NONE => ops.push(Operation::None),
+            ADD => ops.push(Operation::Add),
+            SUB => ops.push(Operation::Sub),
+            MUL => ops.push(Operation::Mul),
+            DIV => ops.push(Operation::Div),
+            REM => ops.push(Operation::Rem),
+            NEG => ops.push(Operation::Neg),
+            SHL => ops.push(Operation::Shl),
+            SHR => ops.push(Operation::Shr),
+            AND => ops.push(Operation::And),
+            OR  => ops.push(Operation::Or),
+            XOR => ops.push(Operation::Xor),
+            NOT => ops.push(Operation::Not),
+            INT_TO_REAL => ops.push(Operation::IntToReal),
+            REAL_TO_INT => ops.push(Operation::RealToInt),
+            CMP => ops.push(Operation::Cmp),
+            CALL => {
+                let n = bytecode.get(cursor)?;
+                cursor += 1;
+                ops.push(Operation::Call(*n));
+            },
+            RETURN => ops.push(Operation::Return),
+            JUMP => {
+                let dst = bytecode.get(cursor..cursor+4)?;
+                cursor += 4;
+                let dst = i32::from_be_bytes(dst.try_into().unwrap());
+                jumps.push((ops.len(), (cursor as i32 + dst) as usize));
+                ops.push(Operation::Jump(0));
+            },
+            JUMP_ZERO => {
+                let dst = bytecode.get(cursor..cursor+4)?;
+                cursor += 4;
+                let dst = i32::from_be_bytes(dst.try_into().unwrap());
+                jumps.push((ops.len(), (cursor as i32 + dst) as usize));
+                ops.push(Operation::JumpZero(0));
+            },
+            JUMP_NEG => {
+                let dst = bytecode.get(cursor..cursor+4)?;
+                cursor += 4;
+                let dst = i32::from_be_bytes(dst.try_into().unwrap());
+                jumps.push((ops.len(), (cursor as i32 + dst) as usize));
+                ops.push(Operation::JumpNeg(0));
+            },
+            LIT_NONE => ops.push(Operation::LiteralNone),
+            LIT_TRUE => ops.push(Operation::LiteralTrue),
+            LIT_FALSE => ops.push(Operation::LiteralFalse),
+            LIT_INT => {
+                let n = bytecode.get(cursor..cursor+8)?;
+                cursor += 8;
+                let int = i64::from_be_bytes(n.try_into().unwrap());
+                ops.push(Operation::LiteralInteger(int))
+            },
+            LIT_REAL => {
+                let n = bytecode.get(cursor..cursor+8)?;
+                cursor += 8;
+                let real = f64::from_be_bytes(n.try_into().unwrap());
+                ops.push(Operation::LiteralReal(real))
+            },
+            FRM_LOAD => {
+                let n = bytecode.get(cursor)?;
+                cursor += 1;
+                ops.push(Operation::FrameLocalLoad(*n));
+            },
+            FRM_STORE => {
+                let n = bytecode.get(cursor)?;
+                cursor += 1;
+                ops.push(Operation::FrameLocalStore(*n));
+            },
+            FRM_SWAP => {
+                let n = bytecode.get(cursor)?;
+                cursor += 1;
+                ops.push(Operation::FrameLocalSwap(*n));
+            },
+            FRM_COPY => ops.push(Operation::FrameStackCopy),
+            FRM_POP => ops.push(Operation::FrameStackPop),
+            LIST_CREATE => ops.push(Operation::ListCreate),
+            LIST_PUSH => ops.push(Operation::ListPush),
+            LIST_POP => ops.push(Operation::ListPop),
+            LIST_DOWNGRADE => ops.push(Operation::ListDowngrade),
+            LIST_UPGRADE => ops.push(Operation::ListUpgrade),
+            BYTES_CREATE => ops.push(Operation::BytesBufferCreate),
+            STR_CREATE => ops.push(Operation::StringBufferCreate),
+            STR_CHAR_AT => ops.push(Operation::StringGetCharAt),
+            STR_CHARS => ops.push(Operation::StringGetChars),
+            SEQ_GET => ops.push(Operation::SeqGet),
+            SEQ_SET => ops.push(Operation::SeqSet),
+            SEQ_GET_SLICE => ops.push(Operation::SeqGetSlice),
+            SEQ_SET_SLICE => ops.push(Operation::SeqSetSlice),
+            SEQ_APPEND => ops.push(Operation::SeqAppend),
+            SEQ_LEN => ops.push(Operation::SeqLen),
+            SEQ_RESIZE => ops.push(Operation::SeqResize),
+            _ => return None,
+        }
+    }
+    for (i, j) in jumps {
+        let dst = offsets.binary_search(&j).ok()?;
+        match &mut ops[i] {
+            | Operation::Jump(n)
+            | Operation::JumpZero(n)
+            | Operation::JumpNeg(n) => *n = dst,
+            _ => unreachable!(),
+        }
+    }
+    Some(ops)
 }

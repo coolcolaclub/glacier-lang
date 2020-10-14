@@ -8,7 +8,7 @@ use datamodel::{Function, NativeFn, Value, ValueType};
 
 pub enum VmAction {
     None,
-    Jump(i16),
+    Jump(i32),
     Call(Rc<Function>, Vec<Value>),
     CallNative(NativeFn, Vec<Value>),
     Return(Value),
