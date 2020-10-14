@@ -8,17 +8,18 @@ pub struct CallStack {
 }
 
 pub struct CallFrame {
-    data: FrameData,
+    stack: Vec<Value>,
+    local: Vec<Value>,
     cursor: usize,
     bytecode: Bytes,
 }
 
 impl CallFrame {
     pub fn new(f: &Function) -> CallFrame {
-        let mut data = FrameData::new();
-        data.store(0, Value::List(f.module.clone()));
+        let local = vec![Value::List(f.module.clone())];
         CallFrame {
-            data,
+            stack: vec![],
+            local,
             cursor: 0,
             bytecode: f.bytecode.clone(),
         }
@@ -32,30 +33,8 @@ impl CallFrame {
         self.cursor = cursor
     }
 
-    pub fn get_data(&self) -> &FrameData {
-        &self.data
-    }
-
-    pub fn get_data_mut(&mut self) -> &mut FrameData {
-        &mut self.data
-    }
-
     pub fn get_bytecode(&self) -> &[u8] {
         &self.bytecode.0
-    }
-}
-
-pub struct FrameData {
-    stack: Vec<Value>,
-    local: Vec<Value>,
-}
-
-impl FrameData {
-    pub fn new() -> FrameData {
-        FrameData {
-            stack: Vec::new(),
-            local: Vec::new(),
-        }
     }
 
     pub fn load(&self, index: u8) -> Result<&Value, VmError> {

@@ -2,10 +2,28 @@ use std::{mem, str};
 use std::rc::{Rc, Weak};
 use std::cell::RefCell;
 use std::any::Any;
+use std::cmp::Ordering;
 
 use crate::VmError;
 
 pub type NativeFn = fn(Vec<Value>) -> Result<Value, VmError>;
+
+pub enum ValueType {
+    None,
+    Bool,
+    Integer,
+    Real,
+    Char,
+    List,
+    ListWeak,
+    Bytes,
+    BytesBuffer,
+    StringValue,
+    StringBuffer,
+    Function,
+    NativeFn,
+    Unknown
+}
 
 #[derive(Clone)]
 pub enum Value {
@@ -44,23 +62,101 @@ impl Value {
             Value::Unknown(_) => ValueType::Unknown,
         }
     }
+
+    pub fn cmp(&self, other: &Value) -> Option<Ordering> {
+        let mut lhs = self;
+        let mut rhs = other;
+        let mut reverse = false;
+        if lhs.get_type() as usize > rhs.get_type() as usize {
+            let t = lhs;
+            lhs = rhs;
+            rhs = t;
+            reverse = true;
+        }
+        let result = pure_value_cmp(lhs, rhs);
+        if reverse {
+            result.map(|o| o.reverse())
+        } else {
+            result
+        }
+    }
 }
 
-pub enum ValueType {
-    None,
-    Bool,
-    Integer,
-    Real,
-    Char,
-    List,
-    ListWeak,
-    Bytes,
-    BytesBuffer,
-    StringValue,
-    StringBuffer,
-    Function,
-    NativeFn,
-    Unknown
+#[inline]
+fn pure_value_cmp(lhs: &Value, rhs: &Value) -> Option<Ordering> {
+    match lhs {
+        Value::None => if let Value::None = rhs {
+            return Some(Ordering::Equal);
+        }
+        Value::Bool(lhs) => if let Value::Bool(rhs) = rhs {
+            return Some(lhs.cmp(rhs));
+        },
+        Value::Integer(lhs) => if let Value::Integer(rhs) = rhs {
+            return Some(lhs.cmp(rhs));
+        },
+        Value::Real(lhs) => if let Value::Real(rhs) = rhs {
+            return lhs.partial_cmp(rhs);
+        },
+        Value::Char(lhs) => if let Value::Char(rhs) = rhs {
+            return Some(lhs.cmp(rhs));
+        },
+        Value::List(lhs) => if let Value::List(rhs) = rhs {
+            if Rc::ptr_eq(&lhs.0, &rhs.0) {
+                return Some(Ordering::Equal);
+            }
+        },
+        Value::ListWeak(lhs) => if let Value::ListWeak(rhs) = rhs {
+            if Weak::ptr_eq(&lhs.0, &rhs.0) {
+                return Some(Ordering::Equal);
+            }
+        }
+        Value::Bytes(lhs) => match rhs {
+            Value::Bytes(rhs) => {
+                if Rc::ptr_eq(&lhs.0, &rhs.0) {
+                    return Some(Ordering::Equal);
+                }
+                return Some(lhs.0.cmp(&rhs.0))
+            },
+            Value::BytesBuffer(rhs) => return Some((*lhs.0).cmp(&rhs.0.borrow())),
+            _ => ()
+        },
+        Value::BytesBuffer(lhs) => if let Value::BytesBuffer(rhs) = rhs {
+            if Rc::ptr_eq(&lhs.0, &rhs.0) {
+                return Some(Ordering::Equal);
+            }
+            return Some(lhs.0.borrow().cmp(&rhs.0.borrow()));
+        },
+        Value::StringValue(lhs) => match rhs {
+            Value::StringValue(rhs) => {
+                if Rc::ptr_eq(&lhs.0.0, &rhs.0.0) {
+                    return Some(Ordering::Equal);
+                }
+                return Some(lhs.as_str().cmp(&rhs.as_str()))
+            },
+            Value::StringBuffer(rhs) => return Some(lhs.as_str().cmp(&rhs.0.borrow())),
+            _ => ()
+        },
+        Value::StringBuffer(lhs) => if let Value::StringBuffer(rhs) = rhs {
+            if Rc::ptr_eq(&lhs.0, &rhs.0) {
+                return Some(Ordering::Equal);
+            }
+            return Some(lhs.0.borrow().cmp(&rhs.0.borrow()));
+        },
+        Value::Function(lhs) => if let Value::Function(rhs) = rhs {
+            if Rc::ptr_eq(lhs, rhs) {
+                return Some(Ordering::Equal);
+            }
+        },
+        Value::NativeFn(lhs) => if let Value::NativeFn(rhs) = rhs {
+            return Some(lhs.cmp(rhs));
+        },
+        Value::Unknown(lhs) => if let Value::Unknown(rhs) = rhs {
+            if Rc::ptr_eq(lhs, rhs) {
+                return Some(Ordering::Equal);
+            }
+        },
+    }
+    return None;
 }
 
 pub struct Function {
@@ -74,6 +170,10 @@ pub struct List(pub Rc<RefCell<Vec<Value>>>);
 impl List {
     pub fn from_vec(vec: Vec<Value>) -> List {
         List(Rc::new(RefCell::new(vec)))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.borrow().len()
     }
 
     pub fn resize(&self, len: usize) {
@@ -136,8 +236,16 @@ impl ListWeak {
 pub struct Bytes(pub Rc<Vec<u8>>);
 
 impl Bytes {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
     pub fn get(&self, index: usize) -> Option<Value> {
         Some(Value::Integer(*self.0.get(index)? as i64))
+    }
+
+    pub fn get_slice(&self, a: usize, b: usize) -> Option<BytesBuffer> {
+        Some(BytesBuffer::from_vec(self.0.get(a..b)?.to_vec()))
     }
 }
 
@@ -147,6 +255,10 @@ pub struct BytesBuffer(pub Rc<RefCell<Vec<u8>>>);
 impl BytesBuffer {
     pub fn from_vec(vec: Vec<u8>) -> BytesBuffer {
         BytesBuffer(Rc::new(RefCell::new(vec)))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.borrow().len()
     }
 
     pub fn resize(&self, len: usize) {
@@ -162,6 +274,10 @@ impl BytesBuffer {
     pub fn set(&self, index: usize, value: u8) -> Option<Value> {
         let mut bytes = self.0.borrow_mut();
         Some(Value::Integer(mem::replace(bytes.get_mut(index)?, value) as i64))
+    }
+
+    pub fn get_slice(&self, a: usize, b: usize) -> Option<BytesBuffer> {
+        Some(BytesBuffer::from_vec(self.0.borrow().get(a..b)?.to_vec()))
     }
 
     pub fn set_slice(&self, src: &[u8], offset: usize) -> Option<()> {
